@@ -3,6 +3,81 @@ import torch.nn as nn
 from einops import rearrange
 import math
 
+def get_offset_tensor_chanel(x, y, c):
+    x+=1
+    y+=1
+    kernel = torch.zeros(size=[1, 3, 3, 3])
+    kernel[0][c][x][y] = 1.0
+    return kernel
+
+# [0,1] [1,0] [0,-1] [-1,0]
+def get_cross_offset(c):
+    #out = get_offset_tensor_chanel(0, 0, c)
+    out = get_offset_tensor_chanel(0, 1, c)
+    out = torch.cat([out, get_offset_tensor_chanel(1, 0, c)], dim=0)
+    out = torch.cat([out, get_offset_tensor_chanel(0, -1, c)], dim=0)
+    out = torch.cat([out, get_offset_tensor_chanel(-1, 0, c)], dim=0)
+    return out
+
+# https://github.com/GPUOpen-Effects/FidelityFX-FSR2/blob/master/src/ffx-fsr2-api/shaders/ffx_fsr2_rcas.h
+# https://www.shadertoy.com/view/7tfSWH
+# ported from shader to tensors format
+# probably not optimal way to execute on pytorch but at least it works with gradients
+# could be made much better with cuda kernel (avoid transfer local memory <-> global memory as in StyleGan3)
+# to do make rcas with 9 pixel pattern
+class RCAS(nn.Module):
+    def __init__(self):
+        super(RCAS, self).__init__()
+        self.register_buffer("r_cross_conv", get_cross_offset(0))
+        #print(self.r_cross_conv.size())
+        self.register_buffer("g_cross_conv", get_cross_offset(1))
+        self.register_buffer("b_cross_conv", get_cross_offset(2))
+        self.pad = nn.ReplicationPad2d(1)
+
+    def forward(self, x):
+        # convert to space [0.0, 1.0]
+        x_converted = (x + 1.0) * 0.5
+        # small eps to avoid division by zero
+        # clip grad during training for sure
+        eps = 0.00001
+        x_clamp = x_converted
+
+        x_pad = self.pad(x_clamp)
+        r_cross = nn.functional.conv2d(input=x_pad, weight=self.r_cross_conv, bias=None, stride=1)
+        g_cross = nn.functional.conv2d(input=x_pad, weight=self.g_cross_conv, bias=None, stride=1)
+        b_cross = nn.functional.conv2d(input=x_pad, weight=self.b_cross_conv, bias=None, stride=1)
+        #print(r_cross.size(), "r_cross")
+        r_max = torch.sum(nn.functional.softmax(r_cross, dim=1) * r_cross, dim=1).unsqueeze(dim=1)
+        g_max = torch.sum(nn.functional.softmax(g_cross, dim=1) * g_cross, dim=1).unsqueeze(dim=1)
+        b_max = torch.sum(nn.functional.softmax(b_cross, dim=1) * b_cross, dim=1).unsqueeze(dim=1)
+        #print(r_max.size(), "r_max")
+        r_min = torch.sum(nn.functional.softmin(r_cross, dim=1) * r_cross, dim=1).unsqueeze(dim=1)
+        g_min = torch.sum(nn.functional.softmin(g_cross, dim=1) * g_cross, dim=1).unsqueeze(dim=1)
+        b_min = torch.sum(nn.functional.softmin(b_cross, dim=1) * b_cross, dim=1).unsqueeze(dim=1)
+        #print(r_min.size(), "r_min")
+        r_sum = torch.sum(r_cross, dim=1).unsqueeze(dim=1)
+        g_sum = torch.sum(g_cross, dim=1).unsqueeze(dim=1)
+        b_sum = torch.sum(b_cross, dim=1).unsqueeze(dim=1)
+        #print(r_sum.size(), "r_sum")
+        sum_tensor = torch.cat([r_sum, g_sum, b_sum], dim=1)
+        #print(sum_tensor.size(), "sum_tensor")
+        r_edges = torch.cat([r_min / (r_max + eps), (1.0 - r_max) / (1.0 - r_min + eps)], dim=1)
+        g_edges = torch.cat([g_min / (g_max + eps), (1.0 - g_max) / (1.0 - g_min + eps)], dim=1)
+        b_edges = torch.cat([b_min / (b_max + eps), (1.0 - b_max) / (1.0 - b_min + eps)], dim=1)
+
+        r_edge = -0.25 * torch.sum(nn.functional.softmin(r_edges, dim=1) * r_edges, dim=1).unsqueeze(dim=1)
+        g_edge = -0.25 * torch.sum(nn.functional.softmin(g_edges, dim=1) * g_edges, dim=1).unsqueeze(dim=1)
+        b_edge = -0.25 * torch.sum(nn.functional.softmin(b_edges, dim=1) * b_edges, dim=1).unsqueeze(dim=1)
+
+        edges = torch.cat([r_edge, g_edge, b_edge], dim=1)
+        edge = torch.sum(nn.functional.softmin(edges, dim=1) * edges, dim=1).unsqueeze(dim=1)
+        w = edge * 0.36787944117
+        out = (x_converted + sum_tensor * w) / (w * 4.0 + 1.0)
+
+        # convert back
+        out = out * 2.0 - 1.0
+        return out
+
 def sinc(x):
     if x == 0.0:
         return 1.0
